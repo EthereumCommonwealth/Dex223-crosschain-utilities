@@ -1,0 +1,5 @@
+web3==7.6.1
+python-dotenv==1.0.1
+tqdm==4.67.1
+pandas==2.3.3
+
