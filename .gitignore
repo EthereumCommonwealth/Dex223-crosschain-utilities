@@ -128,7 +128,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+snapshot/.env
 .venv
 env/
 venv/
@@ -184,3 +184,5 @@ crawler/proxies.txt
 /app/.env
 /app/venv
 /app/src/check.py
+/lost_tokens/.env
+__pycache__
