@@ -6,6 +6,7 @@ from decimal import Decimal
 from datetime import datetime
 from config import AppConfig, load_env
 from services.scanner import LostTokensScannerService
+from services.export import results_to_public_json
 from adapters.web3_gateway import Web3TokenGateway
 from adapters.etherscan_client import EtherscanClient
 from adapters.node_pool import Web3NodePool
@@ -52,7 +53,6 @@ async def run(cfg: AppConfig) -> None:
         base_delay=cfg.retry_base_delay,
         call_timeout=cfg.call_timeout,
     )
-
     etherscan = EtherscanClient(cfg.etherscan_api_key)
     price_repo = (EtherscanPriceRepository(etherscan) if cfg.etherscan_enabled else NullPriceRepository())
     excludes_repo = FileExcludesRepository(in_dir / "excludes.json")
@@ -82,9 +82,16 @@ async def run(cfg: AppConfig) -> None:
         exclude_by_extract=cfg.exclude_by_extract,
     )
     name = f"lost_tokens_result_{start.strftime('%d_%m_%Y')}"
+    public_results = results_to_public_json(
+        results,
+        exclude_by_list=cfg.exclude_by_list,
+        exclude_by_mint=cfg.exclude_by_mint,
+        exclude_by_extract=cfg.exclude_by_extract,
+    )
+
     (out_dir / f"{name}.txt").write_text(report, encoding="utf-8")
     (out_dir / f"{name}.json").write_text(json.dumps(
-        results,
+        public_results,
         default=to_json, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )

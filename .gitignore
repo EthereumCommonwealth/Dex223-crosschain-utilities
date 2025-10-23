@@ -186,3 +186,4 @@ crawler/proxies.txt
 /app/src/check.py
 /lost_tokens/.env
 __pycache__
+lost_tokens/tmp/contracts

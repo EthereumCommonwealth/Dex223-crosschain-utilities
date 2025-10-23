@@ -5,10 +5,10 @@ import logging
 from time import monotonic
 from decimal import Decimal
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional
 
 from web3 import AsyncWeb3
-from eth_abi import encode, decode
+from eth_abi import encode
 
 from ports import (
     TokenGateway, PriceRepository, ExcludesRepository, CacheRepository, EtherscanLike, TokenMeta,
@@ -78,12 +78,6 @@ class LostTokensScannerService:
     async def _ensure_w3(self) -> AsyncWeb3:
         if self._w3_for_mc is not None:
             return self._w3_for_mc
-        # берём клиента из пула gateway (хак: у нас нет прямого доступа, но gateway.next_client есть косвенно)
-        # добавим в gateway лёгкий helper — или просто возьмём мету и перехватим w3:
-        # проще: в token_gateway.balance_of мы всё равно формируем контракт — но нам нужен сам client.
-        # Поэтому создадим отдельный AsyncWeb3 прямо по тому же RPC, что в пуле не страшно:
-        # ЛУЧШЕ: добавь метод get_any_client() в твой Web3NodePool и передай сюда при инициализации.
-        # Чтобы не менять другие файлы, сделаем трюк: возьмём его из token_gateway._nodes
         w3 = await self._token_gateway._nodes.next_client()  # type: ignore
         self._w3_for_mc = w3
         return w3
@@ -94,13 +88,13 @@ class LostTokensScannerService:
         return BALANCE_OF_SELECTOR + encode(["address"], [holder])
 
     async def _prefetch_token_infos(
-            self, tokens: List[str], prices_map: Dict[str, TokenMeta]
-    ) -> Dict[str, Dict]:
+            self, tokens: list[str], prices_map: dict[str, TokenMeta]
+    ) -> dict[str, dict]:
         """
         We're preparing the token metadata (symbol/decimals/price). Whenever possible, we'll take it from prices_map.
         We'll get the rest via gateway.get_token_meta.
         """
-        out: Dict[str, Dict] = {}
+        out: dict[str, dict] = {}
         sem = asyncio.Semaphore(16)  # Let's limit simultaneous web3 meta calls
 
         async def one(addr: str):
@@ -112,7 +106,7 @@ class LostTokensScannerService:
                     "ticker": hint["symbol"] or addr[:6],
                     "decimals": int(hint["decimals"]),
                     "price": Decimal(str(hint.get("price_usd", "0") or 0)),
-                    "logo": None,
+                    "logo": hint.get("logo"),
                 }
                 return
             async with sem:
@@ -125,13 +119,13 @@ class LostTokensScannerService:
                 "ticker": meta["symbol"] or meta["address"][:6],
                 "decimals": meta["decimals"],
                 "price": price_usd,
-                "logo": None,
+                "logo": meta.get("logo"),
             }
 
         await asyncio.gather(*(one(t) for t in tokens))
         return out
 
-    async def scan(self, tokens: List[str]) -> List[TokenScanResult]:
+    async def scan(self, tokens: list[str]) -> list[TokenScanResult]:
         holders = list({AsyncWeb3.to_checksum_address(t) for t in tokens})
         tokens_cs = [AsyncWeb3.to_checksum_address(t) for t in tokens]
         if not tokens_cs:
@@ -143,9 +137,8 @@ class LostTokensScannerService:
 
         # Prepare token information (ticker/decimals/price)
         infos = await self._prefetch_token_infos(tokens_cs, prices_map)
-
         # Let's prepare the resulting baskets for tokens
-        results_by_token: Dict[str, TokenScanResult] = {}
+        results_by_token: dict[str, TokenScanResult] = {}
         for t in tokens_cs:
             i = infos[t.lower()]
             results_by_token[t.lower()] = TokenScanResult(
@@ -185,7 +178,7 @@ class LostTokensScannerService:
                 idx += batch
 
                 # prepare tryAggregate calls (target=token, data=balanceOf(holder))
-                calls: List[Tuple[str, bytes]] = []
+                calls: list[tuple[str, bytes]] = []
                 for token_addr in chunk:
                     # You can skip token==holder, but sometimes it's also interesting - it doesn't interfere
                     calls.append((token_addr, self._encode_balance_of(holder_addr)))
@@ -265,8 +258,7 @@ class LostTokensScannerService:
 
         out = list(results_by_token.values())
         out.sort(key=lambda r: r.asDollar, reverse=True)
-        log.info("Scan finished: %d holders × %d tokens in %.1fs",
-                 len(holders), len(tokens_cs), monotonic() - start_all)
+        log.info(f"Scan finished: {len(holders)} holders × {len(tokens_cs)} tokens in {monotonic() - start_all:.1f}s")
         return out
 
     async def _load_extract_info(self, token_addr: str) -> dict:
@@ -278,10 +270,12 @@ class LostTokensScannerService:
         return analyze_extract(token_addr, src or "")
 
     @staticmethod
-    def format_report(results: List[TokenScanResult],
-                      exclude_by_list: bool,
-                      exclude_by_mint: bool,
-                      exclude_by_extract: bool) -> tuple[str, Decimal, int]:
+    def format_report(
+            results: list[TokenScanResult],
+            exclude_by_list: bool,
+            exclude_by_mint: bool,
+            exclude_by_extract: bool
+    ) -> tuple[str, Decimal, int]:
         total = Decimal(0)
         lines = []
         for res in results:
