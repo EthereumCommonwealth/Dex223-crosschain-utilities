@@ -14,7 +14,14 @@ class EtherscanPriceRepository(PriceRepository):
             price = Decimal(str(meta.get("price", "0") or "0"))
             symbol = meta.get("symbol") or ""
             decimals = int(meta.get("decimals", 18))
-            ret[addr.lower()] = TokenMeta(address=addr, symbol=symbol, decimals=decimals, price_usd=price)
+            logo = meta.get("logo") or None
+            ret[addr.lower()] = TokenMeta(
+                address=addr,
+                symbol=symbol,
+                decimals=decimals,
+                price_usd=price,
+                logo=logo
+            )
 
         logging.getLogger("prices").info(f"Loaded prices: {len(ret)} items (requested tokens: {len(token_addresses)})")
         return ret

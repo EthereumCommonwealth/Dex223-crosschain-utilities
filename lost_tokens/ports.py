@@ -7,6 +7,7 @@ class TokenMeta(dict):
     symbol: str
     decimals: int
     price_usd: Decimal
+    logo: Optional[str] = None
 
 
 class PriceRepository(Protocol):

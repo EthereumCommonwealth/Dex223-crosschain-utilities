@@ -6,8 +6,9 @@ log = logging.getLogger("etherscan_client")
 
 
 class EtherscanClient:
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, chain_id: int = 1) -> None:
         self.api_key = api_key
+        self.chain_id = chain_id
 
     async def get_contract_abi(self, address: str) -> list:
         if not self.api_key:
@@ -27,11 +28,11 @@ class EtherscanClient:
     async def get_contract_source(self, address: str) -> Optional[str]:
         if not self.api_key:
             return None
-        url = f"https://api.etherscan.io/api?module=contract&action=getsourcecode&address={address}&apikey={self.api_key}"
+        url = (f"https://api.etherscan.io/v2/api?module=contract&chainid={self.chain_id}&"
+               f"action=getsourcecode&address={address}&apikey={self.api_key}")
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=30) as r:
                 j = await r.json()
-
         if j.get("status") != "1":
             return None
 
