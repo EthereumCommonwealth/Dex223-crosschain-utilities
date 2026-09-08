@@ -1,7 +1,10 @@
 import re
 from web3 import AsyncWeb3
 
-ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+# The hex boundaries matter: without them a 32-byte value (transaction hash, storage slot, any
+# bytes32 in the input files) matches its first 40 hex characters and yields a fabricated address,
+# which is then scanned for balances and published as a real result.
+ADDRESS_RE = re.compile(r"(?<![0-9a-fA-F])0x[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 
 
 def parse_addresses_from_text(text: str) -> list[str]:

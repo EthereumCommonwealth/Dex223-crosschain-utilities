@@ -34,6 +34,17 @@ async def run(cfg: AppConfig) -> None:
     in_dir = base / "in"
     out_dir = base / "out"
     out_dir.mkdir(exist_ok=True)
+    # read_text() returns "" for a missing file, so a wrong/absent input path used to produce a full
+    # scan with an empty token or contract set and a confident "0 lost" result. Fail loudly instead -
+    # this feeds a public data page.
+    for label, fname in (("TOKENS_FILE", cfg.tokens_file), ("CONTRACTS_FILE", cfg.contracts_file)):
+        if not (in_dir / fname).exists():
+            raise FileNotFoundError(
+                f"{label} not found: {in_dir / fname}. "
+                f"Set {label} to a file that exists in {in_dir} (available: "
+                f"{', '.join(sorted(p.name for p in in_dir.glob('*.txt'))) or 'none'})."
+            )
+
     tokens_src = read_text(in_dir / cfg.tokens_file)
     contracts_src = read_text(in_dir / cfg.contracts_file)
     tokens = uniq(parse_addresses_from_text(tokens_src))
