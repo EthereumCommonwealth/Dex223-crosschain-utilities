@@ -23,5 +23,10 @@ def number_with_commas(n, places=2):
         a, b = s.split(".", 1)
     else:
         a, b = s, ""
-    a = f"{int(a):,}"
+    try:
+        a = f"{int(a):,}"
+    except (TypeError, ValueError):
+        # The try/except above only guarded the f-string; a non-numeric value reached int() and
+        # raised, taking the whole report down. Fall back to the raw text instead.
+        return s
     return f"{a}.{b}"
