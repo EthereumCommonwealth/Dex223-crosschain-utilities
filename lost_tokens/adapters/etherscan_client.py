@@ -13,7 +13,8 @@ class EtherscanClient:
     async def get_contract_abi(self, address: str) -> list:
         if not self.api_key:
             return []
-        url = f"https://api.etherscan.io/api?module=contract&action=getabi&address={address}&apikey={self.api_key}"
+        url = (f"https://api.etherscan.io/v2/api?module=contract&chainid={self.chain_id}&"
+               f"action=getabi&address={address}&apikey={self.api_key}")
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=30) as r:
                 j = await r.json()
