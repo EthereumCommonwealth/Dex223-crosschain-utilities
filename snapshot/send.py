@@ -81,6 +81,9 @@ class AirdropConfig:
     checkpoint_path: str = "airdrop_checkpoint.jsonl"
     dry_run: bool = False
     column: str = "balance_wei"
+    skip_contracts: bool = False
+    source_rpc: Optional[str] = None
+    legacy_gas: bool = False
 
 
 # =========================
@@ -99,14 +102,14 @@ class AddressFilter(Protocol):
 
 
 class FeePolicy(Protocol):
-    async def suggest(self) -> Tuple[int, int]:  # (maxFeePerGas, maxPriorityFeePerGas)
+    async def fields(self) -> Dict[str, int]:  # the fee fields of a transaction
         ...
 
 
 class NonceAllocator(Protocol):
     async def starting_nonce(self) -> int: ...
 
-    def nonce_for(self, local_order: int) -> int: ...
+    async def next(self) -> int: ...
 
 
 class TxSender(Protocol):
@@ -167,7 +170,7 @@ class CompositeFilter(AddressFilter):
         if self.skip_zero and "balance_wei" in res.columns:
             res = res[res["balance_wei"].astype(str).map(int) > 0]
         if self.min_balance_wei > 0 and "balance_wei" in res.columns:
-            res = res[res["balance_wei"].astype[str].map(int) >= self.min_balance_wei]
+            res = res[res["balance_wei"].astype(str).map(int) >= self.min_balance_wei]
         if self.allowset:
             res = res[res["address"].astype(str).str.lower().isin(self.allowset)]
         if self.denyset:
@@ -247,6 +250,21 @@ class Web3FeePolicy(FeePolicy):
         max_fee = int(max_fee * self.max_fee_mult)
         return max_fee, prio
 
+    async def fields(self) -> Dict[str, int]:
+        max_fee, prio = await self.suggest()
+        return {"type": 2, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio}
+
+
+class LegacyFeePolicy(FeePolicy):
+    """Type-0 transactions with gasPrice, for chains without EIP-1559."""
+
+    def __init__(self, w3: AsyncWeb3, max_fee_mult: float = 1.0):
+        self.w3 = w3
+        self.max_fee_mult = max_fee_mult
+
+    async def fields(self) -> Dict[str, int]:
+        return {"gasPrice": int(int(await self.w3.eth.gas_price) * self.max_fee_mult)}
+
 
 # --- NonceAllocator
 class LinearNonceAllocator(NonceAllocator):
@@ -255,6 +273,7 @@ class LinearNonceAllocator(NonceAllocator):
         self.sender = sender
         self._base = forced
         self._cached = None
+        self._lock = asyncio.Lock()
 
     async def starting_nonce(self) -> int:
         if self._base is not None:
@@ -263,11 +282,15 @@ class LinearNonceAllocator(NonceAllocator):
         self._cached = int(await self.w3.eth.get_transaction_count(self.sender, "pending"))
         return self._cached
 
-    def nonce_for(self, local_order: int) -> int:
-        if self._cached is None and self._base is None:
-            raise RuntimeError("starting_nonce() must be called before nonce_for()")
-        base = self._cached if self._cached is not None else self._base
-        return int(base) + int(local_order)
+    async def next(self) -> int:
+        """Hands out nonces in order, only to transactions that are about to be sent. Assigning them up front
+        left a gap whenever a transaction was skipped (a failed estimate), and every later one then stalled."""
+        if self._cached is None:
+            raise RuntimeError("starting_nonce() must be called before next()")
+        async with self._lock:
+            n = self._cached
+            self._cached += 1
+            return n
 
 
 # --- TxSender
@@ -397,13 +420,45 @@ class AirdropUseCase:
         except Exception as e:
             log.warning(f"Cannot read sender token balance: {e}")
 
+    async def _drop_contracts(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drops holders that are contracts on the snapshot chain or the target chain, and writes them to
+        skipped_contracts_<csv name> next to the input. A contract address on the snapshot chain is not
+        controlled by anyone on another chain, so tokens mirrored to it there are unreachable. EIP-7702
+        delegated wallets (code 0xef0100 + 20-byte address) are ordinary keys and are kept."""
+        chains = [AsyncWeb3(AsyncHTTPProvider(self.cfg.source_rpc, request_kwargs={"timeout": 60})), self.w3]
+        sem = asyncio.Semaphore(8)
+
+        async def is_contract(addr: str) -> bool:
+            async with sem:
+                for w3 in chains:
+                    code = bytes(await w3.eth.get_code(Web3.to_checksum_address(addr)))
+                    if code and not (len(code) == 23 and code[:3] == b"\xef\x01\x00"):
+                        return True
+                return False
+
+        flags = await asyncio.gather(*(is_contract(a) for a in df["address"].astype(str)))
+        mask = pd.Series(flags, index=df.index)
+        skipped = df[mask]
+        if len(skipped):
+            head, name = os.path.split(self.cfg.csv_path)
+            path = os.path.join(head, f"skipped_contracts_{name}")
+            skipped.to_csv(path, index=False)
+            share = ""
+            if "balance_wei" in df.columns:
+                total = sum(df["balance_wei"].astype(str).map(int))
+                part = sum(skipped["balance_wei"].astype(str).map(int))
+                share = f" holding {part * 100 / total:.2f}% of the snapshot" if total else ""
+            log.warning(f"Skipping {len(skipped)} contract holder(s){share}; listed in {path}")
+        return df[~mask]
+
     async def run(self, sender_addr: Optional[str], pk: Optional[str]) -> None:
         # load CSV
         df = self.csv_reader.read(self.cfg.csv_path)
         df = self.filters.apply(df)
         if sender_addr:
             df = df[df["address"].str.lower() != sender_addr.lower()]
-        df = df.tail(3)  # last 3 rows
+        if self.cfg.skip_contracts:
+            df = await self._drop_contracts(df)
 
         # build distribution
         decimals = await self._resolve_decimals()
@@ -446,23 +501,27 @@ class AirdropUseCase:
         sem = asyncio.Semaphore(max(1, int(self.cfg.concurrency)))
         chain_id = int(self.cfg.chain_id or (await self.w3.eth.chain_id))
 
-        async def send_one(local_order: int, idx: int, to: str, amount_wei: int) -> bool:
+        async def fill_gap(nonce: int, fees: Dict[str, int]) -> None:
+            # A nonce that was handed out must be used, or every later transaction waits behind it forever.
+            gap: TxParams = {"chainId": chain_id, "to": sender_addr, "value": 0, "nonce": nonce, "gas": 21_000, **fees}
+            try:
+                log.warning(f"nonce {nonce} filled with a 0-value self-transfer: {await self.sender.send_raw(gap, pk)}")
+            except Exception as e:
+                log.error(f"nonce {nonce} could not be filled ({e}); later transactions will wait until it is used")
+
+        async def send_one(idx: Hashable, to: str, amount_wei: int) -> bool:
             if idx in done:
                 return True
 
             async with sem:
-                nonce = self.nonce_alloc.nonce_for(local_order)
-                max_fee, prio = await self.fee_policy.suggest()
+                fees = await self.fee_policy.fields()
 
                 data = self.token.encode_abi("transfer", args=[to, clamp_uint256(int(amount_wei))])
                 tx: TxParams = {
                     "chainId": chain_id,
                     "to": self.token.address,
-                    "nonce": nonce,
-                    "type": 2,
-                    "maxFeePerGas": max_fee,
-                    "maxPriorityFeePerGas": prio,
                     "data": data,
+                    **fees,
                 }
                 # gas
                 try:
@@ -476,6 +535,8 @@ class AirdropUseCase:
                     await self.limiter.acquire()
                     return False
 
+                nonce = await self.nonce_alloc.next()
+                tx["nonce"] = nonce
                 # retries
                 for attempt in range(self.cfg.retries + 1):
                     try:
@@ -494,16 +555,15 @@ class AirdropUseCase:
                             continue
                         log.warning(f"[{idx}] send attempt {attempt} failed: {msg}")
                         await asyncio.sleep(0.8 + attempt * 0.5)
+                await fill_gap(nonce, fees)
                 await self.limiter.acquire()
                 return False
 
         tasks: List[asyncio.Task] = []
-        local_order = 0
         for idx, to, amt in rows:
             if idx in done:
                 continue
-            tasks.append(asyncio.create_task(send_one(base_nonce + local_order - base_nonce, idx, to, amt)))
-            local_order += 1
+            tasks.append(asyncio.create_task(send_one(idx, to, amt)))
 
         log.info(f"Concurrent sends: {sem._value} | tasks: {len(tasks)} | base_nonce: {base_nonce}")
 
@@ -512,8 +572,10 @@ class AirdropUseCase:
             results.append(await f)
         sent = sum(1 for r in results if r)
         failures = len(results) - sent
-        df.to_csv(f'result_{self.cfg.csv_path}', index=False)
-        log.info(f"CSV updated with tx hashes: {self.cfg.csv_path}")
+        head, name = os.path.split(self.cfg.csv_path)
+        result_path = os.path.join(head, f"result_{name}")
+        df.to_csv(result_path, index=False)
+        log.info(f"CSV with tx hashes: {result_path}")
         log.info(f"Done. Sent: {sent}, Failures: {failures}, Checkpoint: {self.cfg.checkpoint_path}")
 
 
@@ -559,7 +621,13 @@ def parse_args() -> AirdropConfig:
     p.add_argument("--checkpoint", default="airdrop_checkpoint.jsonl")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--column", default="balance_wei")
+    p.add_argument("--skip-contracts", action="store_true",
+                   help="skip holders that are contracts on the snapshot chain (--source-rpc) or the target chain")
+    p.add_argument("--source-rpc", help="RPC of the chain the snapshot was taken on; required with --skip-contracts")
+    p.add_argument("--legacy-gas", action="store_true", help="send type-0 transactions (chains without EIP-1559)")
     a = p.parse_args()
+    if a.skip_contracts and not a.source_rpc:
+        p.error("--skip-contracts needs --source-rpc: contracts on the snapshot chain are the ones to skip")
     return AirdropConfig(
         rpc_url=a.rpc,
         token_address=a.token,
@@ -585,6 +653,9 @@ def parse_args() -> AirdropConfig:
         checkpoint_path=a.checkpoint,
         dry_run=a.dry_run,
         column=a.column,
+        skip_contracts=a.skip_contracts,
+        source_rpc=a.source_rpc,
+        legacy_gas=a.legacy_gas,
     )
 
 
@@ -615,7 +686,7 @@ async def main(cfg: AirdropConfig):
     csv_reader = PandasCsvReader()
     filters = CompositeFilter(cfg.min_balance_wei, cfg.skip_zero, cfg.allowlist_path, cfg.denylist_path)
     strategy = build_strategy(cfg)
-    fee_policy = Web3FeePolicy(w3, cfg.max_fee_mult, cfg.priority_mult)
+    fee_policy = LegacyFeePolicy(w3, cfg.max_fee_mult) if cfg.legacy_gas else Web3FeePolicy(w3, cfg.max_fee_mult, cfg.priority_mult)
     nonce_alloc = LinearNonceAllocator(w3, sender_addr or "0x" + "0" * 40, None)
     tx_sender = Web3TxSender(w3, cfg.token_address)
     checkpoint = JsonlCheckpoint(cfg.checkpoint_path)
