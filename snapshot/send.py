@@ -605,8 +605,6 @@ async def main(cfg: AirdropConfig):
 
     # sender
     pk = cfg.pk
-    print(pk)
-    # pk = load_private_key_direct_or_env(cfg.pk, cfg.pk_file, cfg.dry_run)
     sender_addr = Account.from_key(pk).address if pk else None
     if sender_addr:
         log.info(f"Sender: {sender_addr}")

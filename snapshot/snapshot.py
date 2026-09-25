@@ -531,10 +531,28 @@ def build_app(cfg: SnapshotConfig) -> SnapshotService:
 # ================================
 
 if __name__ == "__main__":
+    import argparse
+    import os
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    p = argparse.ArgumentParser(description="Snapshot of every holder of an ERC-20/223 token at one block")
+    # Provider URLs usually embed an API key: pass it via RPC_URL in snapshot/.env (gitignored), never in code.
+    p.add_argument("--rpc", default=os.getenv("RPC_URL"), help="RPC URL (default: RPC_URL env var)")
+    p.add_argument("--token", default=os.getenv("TOKEN_ADDRESS", "0x0908078Da2935A14BC7a17770292818C85b580dd"),
+                   help="token address (default: D223 on Ethereum)")
+    p.add_argument("--block", type=int, default=None, help="snapshot block (default: latest)")
+    a = p.parse_args()
+    if not a.rpc:
+        raise SystemExit("Set RPC_URL (or pass --rpc)")
+    if a.block is None:
+        a.block = Web3(Web3.HTTPProvider(a.rpc)).eth.block_number
+
     # === Config scripts ===
     config = SnapshotConfig(
-        rpc_url="https://lb.drpc.org/ethereum/AraUCj6z2EF7vENFig8OOXDjdvyaDhcR8Jblgk2scBzi",
-        token_address="0x0908078Da2935A14BC7a17770292818C85b580dd",
+        rpc_url=a.rpc,
+        token_address=a.token,
+        snapshot_block=a.block,
         start_block=0,  # you can use 0 - the scanner will "clamp" itself before deployment
         # known_deploy_block=23447751,
         symbol_fallback="TOKEN",

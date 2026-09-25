@@ -129,6 +129,7 @@ celerybeat.pid
 
 # Environments
 snapshot/.env
+.env
 .venv
 env/
 venv/
