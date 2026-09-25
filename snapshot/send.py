@@ -106,7 +106,7 @@ class FeePolicy(Protocol):
 class NonceAllocator(Protocol):
     async def starting_nonce(self) -> int: ...
 
-    def nonce_for(self, local_order: int) -> int: ...
+    async def next(self) -> int: ...
 
 
 class TxSender(Protocol):
@@ -167,7 +167,7 @@ class CompositeFilter(AddressFilter):
         if self.skip_zero and "balance_wei" in res.columns:
             res = res[res["balance_wei"].astype(str).map(int) > 0]
         if self.min_balance_wei > 0 and "balance_wei" in res.columns:
-            res = res[res["balance_wei"].astype[str].map(int) >= self.min_balance_wei]
+            res = res[res["balance_wei"].astype(str).map(int) >= self.min_balance_wei]
         if self.allowset:
             res = res[res["address"].astype(str).str.lower().isin(self.allowset)]
         if self.denyset:
@@ -255,6 +255,7 @@ class LinearNonceAllocator(NonceAllocator):
         self.sender = sender
         self._base = forced
         self._cached = None
+        self._lock = asyncio.Lock()
 
     async def starting_nonce(self) -> int:
         if self._base is not None:
@@ -263,11 +264,15 @@ class LinearNonceAllocator(NonceAllocator):
         self._cached = int(await self.w3.eth.get_transaction_count(self.sender, "pending"))
         return self._cached
 
-    def nonce_for(self, local_order: int) -> int:
-        if self._cached is None and self._base is None:
-            raise RuntimeError("starting_nonce() must be called before nonce_for()")
-        base = self._cached if self._cached is not None else self._base
-        return int(base) + int(local_order)
+    async def next(self) -> int:
+        """Hands out nonces in order, only to transactions that are about to be sent. Assigning them up front
+        left a gap whenever a transaction was skipped (a failed estimate), and every later one then stalled."""
+        if self._cached is None:
+            raise RuntimeError("starting_nonce() must be called before next()")
+        async with self._lock:
+            n = self._cached
+            self._cached += 1
+            return n
 
 
 # --- TxSender
@@ -403,7 +408,6 @@ class AirdropUseCase:
         df = self.filters.apply(df)
         if sender_addr:
             df = df[df["address"].str.lower() != sender_addr.lower()]
-        df = df.tail(3)  # last 3 rows
 
         # build distribution
         decimals = await self._resolve_decimals()
@@ -446,19 +450,26 @@ class AirdropUseCase:
         sem = asyncio.Semaphore(max(1, int(self.cfg.concurrency)))
         chain_id = int(self.cfg.chain_id or (await self.w3.eth.chain_id))
 
-        async def send_one(local_order: int, idx: int, to: str, amount_wei: int) -> bool:
+        async def fill_gap(nonce: int, max_fee: int, prio: int) -> None:
+            # A nonce that was handed out must be used, or every later transaction waits behind it forever.
+            gap: TxParams = {"chainId": chain_id, "to": sender_addr, "value": 0, "nonce": nonce, "gas": 21_000,
+                             "type": 2, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio}
+            try:
+                log.warning(f"nonce {nonce} filled with a 0-value self-transfer: {await self.sender.send_raw(gap, pk)}")
+            except Exception as e:
+                log.error(f"nonce {nonce} could not be filled ({e}); later transactions will wait until it is used")
+
+        async def send_one(idx: Hashable, to: str, amount_wei: int) -> bool:
             if idx in done:
                 return True
 
             async with sem:
-                nonce = self.nonce_alloc.nonce_for(local_order)
                 max_fee, prio = await self.fee_policy.suggest()
 
                 data = self.token.encode_abi("transfer", args=[to, clamp_uint256(int(amount_wei))])
                 tx: TxParams = {
                     "chainId": chain_id,
                     "to": self.token.address,
-                    "nonce": nonce,
                     "type": 2,
                     "maxFeePerGas": max_fee,
                     "maxPriorityFeePerGas": prio,
@@ -476,6 +487,8 @@ class AirdropUseCase:
                     await self.limiter.acquire()
                     return False
 
+                nonce = await self.nonce_alloc.next()
+                tx["nonce"] = nonce
                 # retries
                 for attempt in range(self.cfg.retries + 1):
                     try:
@@ -494,16 +507,15 @@ class AirdropUseCase:
                             continue
                         log.warning(f"[{idx}] send attempt {attempt} failed: {msg}")
                         await asyncio.sleep(0.8 + attempt * 0.5)
+                await fill_gap(nonce, max_fee, prio)
                 await self.limiter.acquire()
                 return False
 
         tasks: List[asyncio.Task] = []
-        local_order = 0
         for idx, to, amt in rows:
             if idx in done:
                 continue
-            tasks.append(asyncio.create_task(send_one(base_nonce + local_order - base_nonce, idx, to, amt)))
-            local_order += 1
+            tasks.append(asyncio.create_task(send_one(idx, to, amt)))
 
         log.info(f"Concurrent sends: {sem._value} | tasks: {len(tasks)} | base_nonce: {base_nonce}")
 
@@ -512,8 +524,10 @@ class AirdropUseCase:
             results.append(await f)
         sent = sum(1 for r in results if r)
         failures = len(results) - sent
-        df.to_csv(f'result_{self.cfg.csv_path}', index=False)
-        log.info(f"CSV updated with tx hashes: {self.cfg.csv_path}")
+        head, name = os.path.split(self.cfg.csv_path)
+        result_path = os.path.join(head, f"result_{name}")
+        df.to_csv(result_path, index=False)
+        log.info(f"CSV with tx hashes: {result_path}")
         log.info(f"Done. Sent: {sent}, Failures: {failures}, Checkpoint: {self.cfg.checkpoint_path}")
 
 
